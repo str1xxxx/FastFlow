@@ -50,27 +50,111 @@ def _render_path_summary(title: str, paths: list[str], style: str) -> None:
         console.print(f"  {path}")
 
 
-@app.command()
-def init(repo_id: str) -> None:
-    """Initialize FastFlow config in the current directory."""
-    root = Path.cwd().resolve()
+def _initialize_project(root: Path, repo_id: str) -> FastFlowConfig:
+    root = root.resolve()
     normalized_repo_id = normalize_repo_id(repo_id)
     config = FastFlowConfig(
         repo_id=normalized_repo_id,
         token=default_token(),
         local_root=str(root),
     )
-    config_path = save_config(config, root)
     asyncio.run(ensure_db(config.state_db_path))
-    console.print(f"[green]Initialized FastFlow[/green] at {root}")
+    save_config(config, root)
+    return config
+
+
+def _print_init_result(config: FastFlowConfig, original_repo_id: str) -> None:
+    config_path = Path(config.local_root).resolve() / ".fastflow.json"
+    console.print(f"[green]Initialized FastFlow[/green] at {config.local_root_path}")
     console.print(f"Config: {config_path}")
     console.print(f"State DB: {config.state_db_path}")
-    if normalized_repo_id != repo_id.strip():
-        console.print(f"Repo ID normalized: {repo_id} -> {normalized_repo_id}")
+    if config.repo_id != original_repo_id.strip():
+        console.print(f"Repo ID normalized: {original_repo_id} -> {config.repo_id}")
     if not config.token:
         console.print(
             "[yellow]HF_TOKEN not found in environment. `token` was initialized as empty.[/yellow]"
         )
+
+
+@app.command()
+def init(repo_id: str) -> None:
+    """Initialize FastFlow config in the current directory."""
+    root = Path.cwd().resolve()
+    config = _initialize_project(root, repo_id)
+    _print_init_result(config, repo_id)
+
+
+async def _clone_async(
+    repo_id: str,
+    destination: str | None,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+) -> int:
+    normalized_repo_id = normalize_repo_id(repo_id)
+    target = Path(destination).expanduser() if destination else Path(normalized_repo_id.split("/")[-1])
+    target = target.resolve()
+
+    if target.exists() and not target.is_dir():
+        console.print(f"[red]Destination exists and is not a directory: {target}[/red]")
+        return 1
+    if target.exists() and any(target.iterdir()):
+        console.print(f"[red]Destination directory is not empty: {target}[/red]")
+        return 1
+
+    target.mkdir(parents=True, exist_ok=True)
+    config = _initialize_project(target, normalized_repo_id)
+    _print_init_result(config, repo_id)
+
+    try:
+        result = await pull_from_hf(
+            config,
+            include_patterns=include,
+            exclude_patterns=exclude,
+            console=console,
+        )
+    except RuntimeError as exc:
+        console.print(f"[red]Clone failed:[/red] {exc}")
+        return 1
+    except Exception as exc:
+        console.print(f"[red]Clone failed:[/red] {exc}")
+        return 1
+
+    _render_path_summary("Downloaded", result.downloaded_paths, "green")
+    if not result.downloaded_paths and not result.deleted_local_paths:
+        console.print("[green]Remote repo is empty or already matched filtered scope.[/green]")
+    console.print(
+        f"Remote files: {result.remote_file_count} | Skipped unchanged: {len(result.skipped_paths)}"
+    )
+    console.print(
+        f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
+    )
+    return 0
+
+
+@app.command()
+def clone(
+    repo_id: str,
+    directory: str | None = typer.Argument(
+        None,
+        help="Destination directory. Defaults to repo name.",
+    ),
+    include: list[str] | None = typer.Option(
+        None,
+        "--include",
+        help="Include glob pattern(s) for paths to clone (repeatable).",
+    ),
+    exclude: list[str] | None = typer.Option(
+        None,
+        "--exclude",
+        help="Exclude glob pattern(s) for paths to skip (repeatable).",
+    ),
+) -> None:
+    """Create a local FastFlow workspace and pull files from Hugging Face."""
+    raise typer.Exit(
+        code=asyncio.run(
+            _clone_async(repo_id, directory, tuple(include or ()), tuple(exclude or ()))
+        )
+    )
 
 
 async def _status_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int:

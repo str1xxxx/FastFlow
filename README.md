@@ -73,6 +73,7 @@ ff sync
 ## Commands
 
 - `ff init <repo_id>`
+- `ff clone <repo_id> [dir]`
 - `ff status`
 - `ff pull`
 - `ff push`
@@ -82,6 +83,7 @@ ff sync
 
 ```bash
 ff init olymprp/trash
+ff clone olymprp/trash my-assets
 ff status
 ff pull
 ff push
