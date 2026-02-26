@@ -25,6 +25,12 @@ pipx install "git+https://github.com/str1xxxx/FastFlow.git"
 ff --help
 ```
 
+Update to the latest release:
+
+```bash
+pipx upgrade fastflow
+```
+
 ### Option 2: local venv
 
 ```bash
