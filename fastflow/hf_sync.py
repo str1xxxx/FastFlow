@@ -1100,7 +1100,14 @@ async def sync_with_hf(
                     record = local_upserts[path]
                     upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
                 elif local_action == "delete":
-                    delete_remote_paths.add(path)
+                    if prefer_conflicts == "local":
+                        delete_remote_paths.add(path)
+                    else:
+                        remote_existing = remote_map.get(path)
+                        if remote_existing is not None:
+                            download_jobs_map[path] = _DownloadJob(remote=remote_existing)
+                        else:
+                            skipped_paths.add(path)
                 continue
 
             # Both sides changed.
