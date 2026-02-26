@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 EXCLUDED_FILENAMES = {CONFIG_FILENAME, STATE_DB_FILENAME}
 HF_LOCAL_CACHE_PREFIX = (".cache", "huggingface")
+FASTFLOW_TRASH_DIRNAME = ".fastflow_trash"
 
 
 def _sha256_file(
@@ -45,6 +46,8 @@ def _discover_candidates(root: Path, path_filter: PathFilter) -> tuple[list[tupl
         if file_path.name in EXCLUDED_FILENAMES:
             continue
         if rel_parts[:2] == HF_LOCAL_CACHE_PREFIX:
+            continue
+        if rel_parts and rel_parts[0] == FASTFLOW_TRASH_DIRNAME:
             continue
 
         stat = file_path.stat()

@@ -50,6 +50,13 @@ def _render_path_summary(title: str, paths: list[str], style: str) -> None:
         console.print(f"  {path}")
 
 
+def _render_remote_cache_bootstrap_notice() -> None:
+    console.print(
+        "[yellow]Remote cache initialized for this workspace.[/yellow] "
+        "Deletion anti-resurrection protection will apply for cached paths from the next sync/pull/push."
+    )
+
+
 async def _initialize_project_async(root: Path, repo_id: str) -> FastFlowConfig:
     root = root.resolve()
     normalized_repo_id = normalize_repo_id(repo_id)
@@ -128,6 +135,7 @@ async def _clone_async(
         return 1
 
     _render_path_summary("Downloaded", result.downloaded_paths, "green")
+    _render_path_summary("Moved to trash (removed upstream)", result.deleted_local_paths, "yellow")
     if not result.downloaded_paths and not result.deleted_local_paths:
         console.print("[green]Remote repo is empty or already matched filtered scope.[/green]")
     console.print(
@@ -136,6 +144,8 @@ async def _clone_async(
     console.print(
         f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
     )
+    if result.remote_cache_bootstrapped:
+        _render_remote_cache_bootstrap_notice()
     if config.repo_id != repo_id.strip():
         console.print(f"Repo ID normalized: {repo_id} -> {config.repo_id}")
     if not config.token:
@@ -280,7 +290,7 @@ async def _pull_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int
         return 1
 
     _render_path_summary("Downloaded", result.downloaded_paths, "green")
-    _render_path_summary("Deleted local (removed upstream)", result.deleted_local_paths, "yellow")
+    _render_path_summary("Moved to trash (removed upstream)", result.deleted_local_paths, "yellow")
     if not result.downloaded_paths and not result.deleted_local_paths:
         console.print("[green]Local workspace already matches remote snapshot.[/green]")
 
@@ -290,6 +300,8 @@ async def _pull_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int
     console.print(
         f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
     )
+    if result.remote_cache_bootstrapped:
+        _render_remote_cache_bootstrap_notice()
     return 0
 
 
@@ -339,6 +351,8 @@ async def _push_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int
     console.print(
         f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
     )
+    if result.remote_cache_bootstrapped:
+        _render_remote_cache_bootstrap_notice()
     return 0
 
 
@@ -393,7 +407,7 @@ async def _sync_async(
 
     _render_path_summary("Downloaded", result.downloaded_paths, "green")
     _render_path_summary("Uploaded", result.uploaded_paths, "green")
-    _render_path_summary("Deleted local", result.deleted_local_paths, "yellow")
+    _render_path_summary("Moved to trash (remote deletes)", result.deleted_local_paths, "yellow")
     _render_path_summary("Deleted remote", result.deleted_remote_paths, "yellow")
     _render_path_summary("Conflicts resolved", result.conflict_paths, "magenta")
 
@@ -409,6 +423,8 @@ async def _sync_async(
     console.print(
         f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
     )
+    if result.remote_cache_bootstrapped:
+        _render_remote_cache_bootstrap_notice()
     return 0
 
 

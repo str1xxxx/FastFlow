@@ -10,7 +10,6 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    SpinnerColumn,
     TaskID,
     TextColumn,
     TimeRemainingColumn,
@@ -30,7 +29,6 @@ class TransferProgressUI:
         self._console = console
         self._lock = threading.Lock()
         self._progress = Progress(
-            SpinnerColumn(),
             TextColumn("[bold]{task.fields[action]}"),
             TextColumn("{task.fields[path_display]}"),
             BarColumn(),
@@ -41,14 +39,20 @@ class TransferProgressUI:
             console=console,
             transient=transient,
             expand=True,
+            auto_refresh=False,
         )
 
     def __enter__(self) -> "TransferProgressUI":
         self._progress.__enter__()
+        with self._lock:
+            self._progress.refresh()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self._progress.__exit__(exc_type, exc, tb)
+
+    def _refresh_locked(self) -> None:
+        self._progress.refresh()
 
     def add_transfer(self, *, action: str, path: str, total_bytes: int | None) -> TransferTaskHandle:
         with self._lock:
@@ -62,26 +66,31 @@ class TransferProgressUI:
                 path_display=_shorten_path(path),
                 state="queued",
             )
+            self._refresh_locked()
         return TransferTaskHandle(task_id=task_id, total=total_bytes, path=path)
 
     def start(self, handle: TransferTaskHandle, state: str = "running") -> None:
         with self._lock:
             self._progress.start_task(handle.task_id)
             self._progress.update(handle.task_id, state=state)
+            self._refresh_locked()
 
     def set_completed(self, handle: TransferTaskHandle, completed: int) -> None:
         with self._lock:
             if handle.total is not None:
                 completed = min(completed, handle.total)
             self._progress.update(handle.task_id, completed=completed)
+            self._refresh_locked()
 
     def advance(self, handle: TransferTaskHandle, delta: int) -> None:
         with self._lock:
             self._progress.update(handle.task_id, advance=max(0, delta))
+            self._refresh_locked()
 
     def set_total(self, handle: TransferTaskHandle, total_bytes: int) -> None:
         with self._lock:
             self._progress.update(handle.task_id, total=total_bytes)
+            self._refresh_locked()
 
     def complete(self, handle: TransferTaskHandle, total_bytes: int | None = None) -> None:
         with self._lock:
@@ -92,10 +101,12 @@ class TransferProgressUI:
             elif handle.total is not None:
                 kwargs["completed"] = handle.total
             self._progress.update(handle.task_id, **kwargs)
+            self._refresh_locked()
 
     def fail(self, handle: TransferTaskHandle, message: str = "failed") -> None:
         with self._lock:
             self._progress.update(handle.task_id, state=message)
+            self._refresh_locked()
 
 
 def _shorten_path(path: str, max_len: int = 48) -> str:

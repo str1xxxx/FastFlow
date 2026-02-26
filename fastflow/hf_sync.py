@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,9 +14,16 @@ from rich.console import Console
 from fastflow.auth import detect_ssh_public_keys, resolve_hf_token, ssh_only_auth_hint
 from fastflow.config import FastFlowConfig, CONFIG_FILENAME, STATE_DB_FILENAME
 from fastflow.filters import PathFilter, build_path_filter
-from fastflow.models import FileRecord
+from fastflow.models import FileRecord, RemoteSnapshotRecord
 from fastflow.scanner import scan_local_files, scan_local_files_with_progress, scan_local_paths
-from fastflow.state_db import load_records, replace_snapshot
+from fastflow.state_db import (
+    get_meta,
+    load_records,
+    load_remote_records,
+    replace_remote_snapshot,
+    replace_snapshot,
+    set_meta,
+)
 from fastflow.status_service import compute_status, diff_records
 from fastflow.transfer_ui import ProgressFileReader, TransferProgressUI
 
@@ -25,6 +33,8 @@ REMOTE_EXCLUDED_PATHS = {CONFIG_FILENAME, STATE_DB_FILENAME}
 LARGE_FILE_THRESHOLD_BYTES = 128 * 1024 * 1024
 LARGE_EXTENSIONS = {".rpf"}
 DEFAULT_SMALL_FILE_WORKERS = 6
+FASTFLOW_TRASH_DIRNAME = ".fastflow_trash"
+REMOTE_CACHE_INITIALIZED_META_KEY = "remote_cache_initialized"
 T = TypeVar("T")
 
 
@@ -55,6 +65,7 @@ class PullResult:
     skipped_paths: list[str]
     deleted_local_paths: list[str]
     snapshot_count: int
+    remote_cache_bootstrapped: bool = False
 
 
 @dataclass(slots=True)
@@ -63,6 +74,7 @@ class PushResult:
     deleted_remote_paths: list[str]
     skipped_paths: list[str]
     snapshot_count: int
+    remote_cache_bootstrapped: bool = False
 
 
 @dataclass(slots=True)
@@ -74,6 +86,7 @@ class SyncResult:
     conflict_paths: list[str]
     skipped_paths: list[str]
     snapshot_count: int
+    remote_cache_bootstrapped: bool = False
 
 
 @dataclass(slots=True)
@@ -280,6 +293,49 @@ def _remote_manifest(config: FastFlowConfig, *, path_filter: PathFilter | None =
     return manifest
 
 
+def _to_remote_snapshot_record(remote: RemoteFileRecord) -> RemoteSnapshotRecord:
+    return RemoteSnapshotRecord(
+        path=remote.path,
+        sha256=remote.sha256,
+        size=remote.size,
+        oid=remote.oid,
+    )
+
+
+def _merge_remote_snapshot_scope(
+    previous_remote: dict[str, RemoteSnapshotRecord],
+    *,
+    path_filter: PathFilter,
+    scope_remote_files: list[RemoteFileRecord],
+) -> dict[str, RemoteSnapshotRecord]:
+    merged = {path: record for path, record in previous_remote.items() if not path_filter.matches(path)}
+    for remote in scope_remote_files:
+        merged[remote.path] = _to_remote_snapshot_record(remote)
+    return merged
+
+
+async def _is_remote_cache_initialized(config: FastFlowConfig) -> bool:
+    return (await get_meta(config.state_db_path, REMOTE_CACHE_INITIALIZED_META_KEY)) == "1"
+
+
+async def _set_remote_cache_initialized(config: FastFlowConfig, initialized: bool = True) -> None:
+    await set_meta(config.state_db_path, REMOTE_CACHE_INITIALIZED_META_KEY, "1" if initialized else "0")
+
+
+async def _write_remote_snapshot_map(
+    config: FastFlowConfig,
+    *,
+    snapshot_map: dict[str, RemoteSnapshotRecord],
+    console: Console | None = None,
+) -> None:
+    with _phase_timer(console, "remote cache update"):
+        await replace_remote_snapshot(
+            config.state_db_path,
+            sorted(snapshot_map.values(), key=lambda item: item.path),
+        )
+        await _set_remote_cache_initialized(config, True)
+
+
 def _local_file_path(local_root: Path, relative_path: str) -> Path:
     return (local_root / Path(relative_path)).resolve()
 
@@ -359,7 +415,10 @@ def _download_one(
     stop_event = threading.Event()
     monitor_thread: threading.Thread | None = None
     if ui is not None and handle is not None:
-        ui.start(handle, state="downloading")
+        download_state = "downloading"
+        if _is_large_transfer(remote.path, remote.size):
+            download_state = "downloading (hf-managed)"
+        ui.start(handle, state=download_state)
         monitor_thread = threading.Thread(
             target=_monitor_file_progress,
             kwargs={"path": target_path, "ui": ui, "handle": handle, "stop_event": stop_event},
@@ -391,11 +450,7 @@ def _download_one(
             monitor_thread.join(timeout=1.0)
 
 
-def _delete_local_file(local_root: Path, relative_path: str) -> bool:
-    path = _local_file_path(local_root, relative_path)
-    if not path.exists() or not path.is_file():
-        return False
-    path.unlink()
+def _cleanup_empty_parents(local_root: Path, path: Path) -> None:
     current = path.parent
     while current != local_root:
         try:
@@ -403,6 +458,51 @@ def _delete_local_file(local_root: Path, relative_path: str) -> bool:
         except OSError:
             break
         current = current.parent
+
+
+def _delete_local_file(local_root: Path, relative_path: str) -> bool:
+    path = _local_file_path(local_root, relative_path)
+    if not path.exists() or not path.is_file():
+        return False
+    path.unlink()
+    _cleanup_empty_parents(local_root, path)
+    return True
+
+
+def _new_trash_session_dir(local_root: Path) -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = local_root / FASTFLOW_TRASH_DIRNAME / ts
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        suffix += 1
+        candidate = local_root / FASTFLOW_TRASH_DIRNAME / f"{ts}-{suffix}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _move_local_file_to_trash(
+    local_root: Path,
+    relative_path: str,
+    *,
+    trash_session_dir: Path,
+) -> bool:
+    path = _local_file_path(local_root, relative_path)
+    if not path.exists() or not path.is_file():
+        return False
+
+    destination = (trash_session_dir / Path(relative_path)).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.replace(destination)
+    except OSError:
+        # Cross-device or platform-specific move edge cases: fallback to copy+delete.
+        import shutil
+
+        shutil.copy2(path, destination)
+        path.unlink()
+
+    _cleanup_empty_parents(local_root, path)
     return True
 
 
@@ -423,7 +523,10 @@ def _upload_one(
     def _call() -> Any:
         if ui is None or handle is None or not use_buffer_wrapper:
             if ui is not None and handle is not None:
-                ui.start(handle, state="uploading")
+                upload_state = "uploading"
+                if not use_buffer_wrapper:
+                    upload_state = "uploading (hf-managed)"
+                ui.start(handle, state=upload_state)
             return api.upload_file(
                 path_or_fileobj=str(local_path),
                 path_in_repo=relative_path,
@@ -738,6 +841,9 @@ async def pull_from_hf(
     path_filter = build_path_filter(include_patterns, exclude_patterns)
 
     previous_records = await load_records(config.state_db_path)
+    previous_remote_records = await load_remote_records(config.state_db_path)
+    remote_cache_initialized = await _is_remote_cache_initialized(config)
+    remote_cache_bootstrapped = not remote_cache_initialized
     with _phase_timer(console, "remote manifest"):
         remote_files = _remote_manifest(config, path_filter=path_filter)
     remote_map = {item.path: item for item in remote_files}
@@ -752,8 +858,15 @@ async def pull_from_hf(
         skipped_paths = sorted(
             item.path for item in remote_files if item.path not in download_job_paths
         )
-        removed_scope_paths = _paths_with_filter(set(previous_records) - set(remote_map), path_filter)
+        if remote_cache_initialized:
+            removed_scope_paths = _paths_with_filter(
+                set(previous_remote_records) - set(remote_map),
+                path_filter,
+            )
+        else:
+            removed_scope_paths = []
     deleted_local_paths: list[str] = []
+    trash_session_dir = _new_trash_session_dir(local_root) if removed_scope_paths else None
 
     with _phase_timer(console, "downloads"):
         downloaded_paths = _run_download_jobs(
@@ -764,10 +877,14 @@ async def pull_from_hf(
             progress_transient=progress_transient,
         )
 
-    # Delete only within the filtered scope.
+    # Delete only within the filtered scope and only for known remote-deletes.
     with _phase_timer(console, "apply local deletes"):
         for path in removed_scope_paths:
-            if _delete_local_file(local_root, path):
+            if trash_session_dir is not None and _move_local_file_to_trash(
+                local_root,
+                path,
+                trash_session_dir=trash_session_dir,
+            ):
                 deleted_local_paths.append(path)
 
     snapshot_map = dict(previous_records)
@@ -781,6 +898,13 @@ async def pull_from_hf(
         )
     )
     snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
+    remote_snapshot_map = _merge_remote_snapshot_scope(
+        previous_remote_records,
+        path_filter=path_filter,
+        scope_remote_files=remote_files,
+    )
+    _apply_snapshot_removals(remote_snapshot_map, removed_scope_paths)
+    await _write_remote_snapshot_map(config, snapshot_map=remote_snapshot_map, console=console)
 
     return PullResult(
         remote_file_count=len(remote_files),
@@ -788,6 +912,7 @@ async def pull_from_hf(
         skipped_paths=skipped_paths,
         deleted_local_paths=sorted(deleted_local_paths),
         snapshot_count=snapshot_count,
+        remote_cache_bootstrapped=remote_cache_bootstrapped,
     )
 
 
@@ -807,6 +932,9 @@ async def push_to_hf(
 
     path_filter = build_path_filter(include_patterns, exclude_patterns)
     previous_records = await load_records(config.state_db_path)
+    previous_remote_records = await load_remote_records(config.state_db_path)
+    remote_cache_initialized = await _is_remote_cache_initialized(config)
+    remote_cache_bootstrapped = not remote_cache_initialized
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
     }
@@ -854,12 +982,27 @@ async def push_to_hf(
         scope_records=current_records,
     )
     snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
+    with _phase_timer(console, "remote manifest (post-push)"):
+        remote_files_after_push = _remote_manifest(config, path_filter=path_filter)
+    remote_snapshot_map = _merge_remote_snapshot_scope(
+        previous_remote_records,
+        path_filter=path_filter,
+        scope_remote_files=remote_files_after_push,
+    )
+    remote_paths_after_push = {item.path for item in remote_files_after_push}
+    remote_removed_scope_paths = _paths_with_filter(
+        set(previous_remote_records) - remote_paths_after_push,
+        path_filter,
+    )
+    _apply_snapshot_removals(remote_snapshot_map, remote_removed_scope_paths)
+    await _write_remote_snapshot_map(config, snapshot_map=remote_snapshot_map, console=console)
 
     return PushResult(
         uploaded_paths=uploaded_paths,
         deleted_remote_paths=sorted(deleted_remote_paths),
         skipped_paths=skipped_paths,
         snapshot_count=snapshot_count,
+        remote_cache_bootstrapped=remote_cache_bootstrapped,
     )
 
 
@@ -884,6 +1027,9 @@ async def sync_with_hf(
     path_filter = build_path_filter(include_patterns, exclude_patterns)
 
     previous_records = await load_records(config.state_db_path)
+    previous_remote_records = await load_remote_records(config.state_db_path)
+    remote_cache_initialized = await _is_remote_cache_initialized(config)
+    remote_cache_bootstrapped = not remote_cache_initialized
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
     }
@@ -908,9 +1054,15 @@ async def sync_with_hf(
         for remote in remote_files:
             if _remote_changed_since_snapshot(remote, previous_records.get(remote.path)):
                 remote_upserts[remote.path] = remote
-        remote_deletes = {
-            path for path in previous_records if path_filter.matches(path) and path not in remote_map
-        }
+        remote_deletes = (
+            {
+                path
+                for path in previous_remote_records
+                if path_filter.matches(path) and path not in remote_map
+            }
+            if remote_cache_initialized
+            else set()
+        )
 
         all_changed_paths = sorted(set(local_upserts) | local_deletes | set(remote_upserts) | remote_deletes)
 
@@ -1006,9 +1158,14 @@ async def sync_with_hf(
             )
 
     deleted_local_done: list[str] = []
+    trash_session_dir = _new_trash_session_dir(local_root) if delete_local_paths else None
     with _phase_timer(console, "local deletes"):
         for path in sorted(delete_local_paths):
-            if _delete_local_file(local_root, path):
+            if trash_session_dir is not None and _move_local_file_to_trash(
+                local_root,
+                path,
+                trash_session_dir=trash_session_dir,
+            ):
                 deleted_local_done.append(path)
 
     deleted_remote_done: list[str] = []
@@ -1037,6 +1194,24 @@ async def sync_with_hf(
         )
     )
     snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
+    remote_mutated = bool(uploaded_paths or deleted_remote_done)
+    if remote_mutated:
+        with _phase_timer(console, "remote manifest (post-sync)"):
+            final_remote_files = _remote_manifest(config, path_filter=path_filter)
+    else:
+        final_remote_files = remote_files
+    final_remote_map = {item.path: item for item in final_remote_files}
+    remote_snapshot_map = _merge_remote_snapshot_scope(
+        previous_remote_records,
+        path_filter=path_filter,
+        scope_remote_files=final_remote_files,
+    )
+    remote_removed_scope_paths = _paths_with_filter(
+        set(previous_remote_records) - set(final_remote_map),
+        path_filter,
+    )
+    _apply_snapshot_removals(remote_snapshot_map, remote_removed_scope_paths)
+    await _write_remote_snapshot_map(config, snapshot_map=remote_snapshot_map, console=console)
     downloaded_set = set(downloaded_paths)
     uploaded_set = set(uploaded_paths)
     deleted_local_done_set = set(deleted_local_done)
@@ -1060,4 +1235,5 @@ async def sync_with_hf(
         conflict_paths=sorted(conflict_paths),
         skipped_paths=sorted(skipped_paths),
         snapshot_count=snapshot_count,
+        remote_cache_bootstrapped=remote_cache_bootstrapped,
     )
