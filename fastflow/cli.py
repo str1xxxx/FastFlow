@@ -17,7 +17,7 @@ from fastflow.config import (
 )
 from fastflow.filters import build_path_filter
 from fastflow.hf_sync import pull_from_hf, push_to_hf, sync_with_hf
-from fastflow.scanner import scan_local_files
+from fastflow.scanner import scan_local_files, scan_local_files_with_progress
 from fastflow.state_db import ensure_db, load_records
 from fastflow.status_service import diff_records
 
@@ -92,10 +92,11 @@ async def _status_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> i
     }
 
     console.print(f"Scanning [bold]{local_root}[/bold] ...")
-    current_records = scan_local_files(
+    current_records = scan_local_files_with_progress(
         local_root,
         previous_records=previous_records,
         path_filter=path_filter,
+        console=console,
     )
     result = diff_records(previous_filtered, current_records)
 
