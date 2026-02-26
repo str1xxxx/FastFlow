@@ -19,7 +19,7 @@ from fastflow.filters import build_path_filter
 from fastflow.hf_sync import pull_from_hf, push_to_hf, sync_with_hf
 from fastflow.scanner import scan_local_files, scan_local_files_with_progress
 from fastflow.state_db import ensure_db, load_records
-from fastflow.status_service import diff_records
+from fastflow.status_service import diff_records, refresh_snapshot
 
 
 app = typer.Typer(help="FastFlow CLI")
@@ -50,7 +50,7 @@ def _render_path_summary(title: str, paths: list[str], style: str) -> None:
         console.print(f"  {path}")
 
 
-def _initialize_project(root: Path, repo_id: str) -> FastFlowConfig:
+async def _initialize_project_async(root: Path, repo_id: str) -> FastFlowConfig:
     root = root.resolve()
     normalized_repo_id = normalize_repo_id(repo_id)
     config = FastFlowConfig(
@@ -58,9 +58,13 @@ def _initialize_project(root: Path, repo_id: str) -> FastFlowConfig:
         token=default_token(),
         local_root=str(root),
     )
-    asyncio.run(ensure_db(config.state_db_path))
+    await ensure_db(config.state_db_path)
     save_config(config, root)
     return config
+
+
+def _initialize_project(root: Path, repo_id: str) -> FastFlowConfig:
+    return asyncio.run(_initialize_project_async(root, repo_id))
 
 
 def _print_init_result(config: FastFlowConfig, original_repo_id: str) -> None:
@@ -102,8 +106,11 @@ async def _clone_async(
         return 1
 
     target.mkdir(parents=True, exist_ok=True)
-    config = _initialize_project(target, normalized_repo_id)
-    _print_init_result(config, repo_id)
+    console.print(
+        f"Cloning [bold]{normalized_repo_id}[/bold] into [bold]{target.name}[/bold] ..."
+    )
+    config = await _initialize_project_async(target, normalized_repo_id)
+    console.print(f"Workspace: {target}")
 
     try:
         result = await pull_from_hf(
@@ -111,6 +118,7 @@ async def _clone_async(
             include_patterns=include,
             exclude_patterns=exclude,
             console=console,
+            progress_transient=True,
         )
     except RuntimeError as exc:
         console.print(f"[red]Clone failed:[/red] {exc}")
@@ -128,6 +136,12 @@ async def _clone_async(
     console.print(
         f"Snapshot updated: {result.snapshot_count} tracked file(s) in {config.state_db_path}"
     )
+    if config.repo_id != repo_id.strip():
+        console.print(f"Repo ID normalized: {repo_id} -> {config.repo_id}")
+    if not config.token:
+        console.print(
+            "[yellow]HF_TOKEN not found in environment. `token` was initialized as empty.[/yellow]"
+        )
     return 0
 
 
@@ -157,7 +171,12 @@ def clone(
     )
 
 
-async def _status_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int:
+async def _status_async(
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+    *,
+    refresh_snapshot_after: bool = False,
+) -> int:
     try:
         config = load_config()
     except FileNotFoundError as exc:
@@ -176,12 +195,19 @@ async def _status_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> i
     }
 
     console.print(f"Scanning [bold]{local_root}[/bold] ...")
-    current_records = scan_local_files_with_progress(
-        local_root,
-        previous_records=previous_records,
-        path_filter=path_filter,
-        console=console,
-    )
+    try:
+        current_records = scan_local_files_with_progress(
+            local_root,
+            previous_records=previous_records,
+            path_filter=path_filter,
+            console=console,
+        )
+    except KeyboardInterrupt:
+        console.print(
+            "[yellow]Status interrupted.[/yellow] Snapshot was not updated. "
+            "Use `ff status --refresh-snapshot` after a full scan if you want a local baseline."
+        )
+        return 130
     result = diff_records(previous_filtered, current_records)
 
     _render_changes("New", result.new_files)
@@ -190,6 +216,13 @@ async def _status_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> i
 
     if not result.has_changes:
         console.print("[green]No changes detected.[/green]")
+
+    if refresh_snapshot_after:
+        await refresh_snapshot(config.state_db_path, current_records)
+        console.print(
+            f"[green]Snapshot refreshed:[/green] {len(current_records)} tracked file(s) in {config.state_db_path}"
+        )
+        return 0
 
     console.print(
         f"Current scan: {result.snapshot_count} file(s). Snapshot baseline remains in {config.state_db_path}"
@@ -209,9 +242,22 @@ def status(
         "--exclude",
         help="Exclude glob pattern(s) for paths to ignore (repeatable).",
     ),
+    refresh_snapshot_flag: bool = typer.Option(
+        False,
+        "--refresh-snapshot",
+        help="Refresh the local SQLite snapshot after scanning (local-only baseline update).",
+    ),
 ) -> None:
     """Show local file changes compared to the last SQLite snapshot."""
-    raise typer.Exit(code=asyncio.run(_status_async(tuple(include or ()), tuple(exclude or ()))))
+    raise typer.Exit(
+        code=asyncio.run(
+            _status_async(
+                tuple(include or ()),
+                tuple(exclude or ()),
+                refresh_snapshot_after=refresh_snapshot_flag,
+            )
+        )
+    )
 
 
 async def _pull_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int:
@@ -223,6 +269,9 @@ async def _pull_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int
             exclude_patterns=exclude,
             console=console,
         )
+    except KeyboardInterrupt:
+        console.print("[yellow]Pull interrupted.[/yellow] Local/remote transfer may be partial.")
+        return 130
     except (FileNotFoundError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
@@ -270,6 +319,9 @@ async def _push_async(include: tuple[str, ...], exclude: tuple[str, ...]) -> int
             exclude_patterns=exclude,
             console=console,
         )
+    except KeyboardInterrupt:
+        console.print("[yellow]Push interrupted.[/yellow] Remote transfer may be partial.")
+        return 130
     except (FileNotFoundError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
@@ -326,6 +378,12 @@ async def _sync_async(
             prefer_conflicts=prefer_normalized,  # type: ignore[arg-type]
             console=console,
         )
+    except KeyboardInterrupt:
+        console.print(
+            "[yellow]Sync interrupted.[/yellow] Snapshot may be stale. "
+            "Use `ff status --refresh-snapshot` for a local baseline or rerun `ff sync`."
+        )
+        return 130
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         return 1

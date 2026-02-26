@@ -26,20 +26,20 @@ class TransferTaskHandle:
 
 
 class TransferProgressUI:
-    def __init__(self, console: Console | None = None) -> None:
+    def __init__(self, console: Console | None = None, *, transient: bool = False) -> None:
         self._console = console
         self._lock = threading.Lock()
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold]{task.fields[action]}"),
-            TextColumn("{task.fields[path]}"),
+            TextColumn("{task.fields[path_display]}"),
             BarColumn(),
             DownloadColumn(binary_units=True),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
             TextColumn("{task.fields[state]}"),
             console=console,
-            transient=False,
+            transient=transient,
             expand=True,
         )
 
@@ -59,6 +59,7 @@ class TransferProgressUI:
                 start=False,
                 action=action,
                 path=path,
+                path_display=_shorten_path(path),
                 state="queued",
             )
         return TransferTaskHandle(task_id=task_id, total=total_bytes, path=path)
@@ -95,6 +96,17 @@ class TransferProgressUI:
     def fail(self, handle: TransferTaskHandle, message: str = "failed") -> None:
         with self._lock:
             self._progress.update(handle.task_id, state=message)
+
+
+def _shorten_path(path: str, max_len: int = 48) -> str:
+    if len(path) <= max_len:
+        return path
+    keep = max_len - 3
+    if keep <= 0:
+        return path[:max_len]
+    head = keep // 2
+    tail = keep - head
+    return f"{path[:head]}...{path[-tail:]}"
 
 
 class ProgressFileReader(io.BufferedIOBase):

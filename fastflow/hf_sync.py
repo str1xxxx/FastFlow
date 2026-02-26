@@ -14,7 +14,7 @@ from fastflow.auth import detect_ssh_public_keys, resolve_hf_token, ssh_only_aut
 from fastflow.config import FastFlowConfig, CONFIG_FILENAME, STATE_DB_FILENAME
 from fastflow.filters import PathFilter, build_path_filter
 from fastflow.models import FileRecord
-from fastflow.scanner import scan_local_files
+from fastflow.scanner import scan_local_files, scan_local_files_with_progress, scan_local_paths
 from fastflow.state_db import load_records, replace_snapshot
 from fastflow.status_service import compute_status, diff_records
 from fastflow.transfer_ui import ProgressFileReader, TransferProgressUI
@@ -518,13 +518,14 @@ def _run_download_jobs(
     *,
     console: Console | None,
     small_file_workers: int,
+    progress_transient: bool = False,
 ) -> list[str]:
     if not jobs:
         return []
     downloaded: list[str] = []
 
     with _suppress_hf_progress_bars():
-        with TransferProgressUI(console=console) as ui:
+        with TransferProgressUI(console=console, transient=progress_transient) as ui:
             handles = {
                 job.remote.path: ui.add_transfer(
                     action="GET",
@@ -562,13 +563,14 @@ def _run_upload_jobs(
     *,
     console: Console | None,
     small_file_workers: int,
+    progress_transient: bool = False,
 ) -> list[str]:
     if not jobs:
         return []
     uploaded: list[str] = []
 
     with _suppress_hf_progress_bars():
-        with TransferProgressUI(console=console) as ui:
+        with TransferProgressUI(console=console, transient=progress_transient) as ui:
             handles = {
                 job.path: ui.add_transfer(
                     action="PUT",
@@ -638,14 +640,88 @@ def _paths_with_filter(paths: list[str] | set[str], path_filter: PathFilter) -> 
     return sorted(path for path in paths if path_filter.matches(path))
 
 
-async def _refresh_full_snapshot(
+@contextmanager
+def _phase_timer(console: Console | None, label: str):
+    start = time.perf_counter()
+    if console is not None:
+        console.print(f"[cyan]Phase:[/cyan] {label} ...")
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if console is not None:
+            console.print(f"[dim]Phase complete:[/dim] {label} ({elapsed:.1f}s)")
+
+
+def _scan_local_records_for_operation(
     config: FastFlowConfig,
     *,
     previous_records: dict[str, FileRecord],
+    path_filter: PathFilter,
+    console: Console | None,
+) -> list[FileRecord]:
+    with _phase_timer(console, "local scan"):
+        if console is not None:
+            return scan_local_files_with_progress(
+                config.local_root_path,
+                previous_records=previous_records,
+                path_filter=path_filter,
+                console=console,
+            )
+        return scan_local_files(
+            config.local_root_path,
+            previous_records=previous_records,
+            path_filter=path_filter,
+        )
+
+
+def _merge_snapshot_scope(
+    previous_records: dict[str, FileRecord],
+    *,
+    path_filter: PathFilter,
+    scope_records: list[FileRecord],
+) -> dict[str, FileRecord]:
+    merged = {path: record for path, record in previous_records.items() if not path_filter.matches(path)}
+    for record in scope_records:
+        merged[record.path] = record
+    return merged
+
+
+def _apply_snapshot_removals(snapshot_map: dict[str, FileRecord], paths: list[str] | set[str]) -> None:
+    for path in paths:
+        snapshot_map.pop(path, None)
+
+
+def _refresh_snapshot_paths(
+    config: FastFlowConfig,
+    *,
+    previous_records: dict[str, FileRecord],
+    paths: list[str] | set[str],
+    console: Console | None = None,
+) -> dict[str, FileRecord]:
+    target_paths = sorted(set(paths))
+    if not target_paths:
+        return {}
+
+    with _phase_timer(console, f"snapshot rescan ({len(target_paths)} path(s))"):
+        refreshed = scan_local_paths(
+            config.local_root_path,
+            target_paths,
+            previous_records=previous_records,
+        )
+    return {record.path: record for record in refreshed}
+
+
+async def _write_snapshot_map(
+    config: FastFlowConfig,
+    *,
+    snapshot_map: dict[str, FileRecord],
+    console: Console | None = None,
 ) -> int:
-    current_records = scan_local_files(config.local_root_path, previous_records=previous_records)
-    await replace_snapshot(config.state_db_path, current_records)
-    return len(current_records)
+    with _phase_timer(console, "snapshot update"):
+        records = sorted(snapshot_map.values(), key=lambda item: item.path)
+        await replace_snapshot(config.state_db_path, records)
+    return len(snapshot_map)
 
 
 async def pull_from_hf(
@@ -655,38 +731,56 @@ async def pull_from_hf(
     exclude_patterns: tuple[str, ...] = (),
     console: Console | None = None,
     small_file_workers: int = DEFAULT_SMALL_FILE_WORKERS,
+    progress_transient: bool = False,
 ) -> PullResult:
     local_root = config.local_root_path
     local_root.mkdir(parents=True, exist_ok=True)
     path_filter = build_path_filter(include_patterns, exclude_patterns)
 
     previous_records = await load_records(config.state_db_path)
-    remote_files = _remote_manifest(config, path_filter=path_filter)
+    with _phase_timer(console, "remote manifest"):
+        remote_files = _remote_manifest(config, path_filter=path_filter)
     remote_map = {item.path: item for item in remote_files}
 
-    download_jobs = [
-        _DownloadJob(remote=item)
-        for item in remote_files
-        if _should_download(item, previous_records, local_root)
-    ]
-    skipped_paths = sorted(
-        item.path for item in remote_files if item.path not in {job.remote.path for job in download_jobs}
-    )
+    with _phase_timer(console, "planning"):
+        download_jobs = [
+            _DownloadJob(remote=item)
+            for item in remote_files
+            if _should_download(item, previous_records, local_root)
+        ]
+        download_job_paths = {job.remote.path for job in download_jobs}
+        skipped_paths = sorted(
+            item.path for item in remote_files if item.path not in download_job_paths
+        )
+        removed_scope_paths = _paths_with_filter(set(previous_records) - set(remote_map), path_filter)
     deleted_local_paths: list[str] = []
 
-    downloaded_paths = _run_download_jobs(
-        config,
-        download_jobs,
-        console=console,
-        small_file_workers=small_file_workers,
-    )
+    with _phase_timer(console, "downloads"):
+        downloaded_paths = _run_download_jobs(
+            config,
+            download_jobs,
+            console=console,
+            small_file_workers=small_file_workers,
+            progress_transient=progress_transient,
+        )
 
     # Delete only within the filtered scope.
-    for path in _paths_with_filter(set(previous_records) - set(remote_map), path_filter):
-        if _delete_local_file(local_root, path):
-            deleted_local_paths.append(path)
+    with _phase_timer(console, "apply local deletes"):
+        for path in removed_scope_paths:
+            if _delete_local_file(local_root, path):
+                deleted_local_paths.append(path)
 
-    snapshot_count = await _refresh_full_snapshot(config, previous_records=previous_records)
+    snapshot_map = dict(previous_records)
+    _apply_snapshot_removals(snapshot_map, removed_scope_paths)
+    snapshot_map.update(
+        _refresh_snapshot_paths(
+            config,
+            previous_records=previous_records,
+            paths=downloaded_paths,
+            console=console,
+        )
+    )
+    snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
 
     return PullResult(
         remote_file_count=len(remote_files),
@@ -704,6 +798,7 @@ async def push_to_hf(
     exclude_patterns: tuple[str, ...] = (),
     console: Console | None = None,
     small_file_workers: int = DEFAULT_SMALL_FILE_WORKERS,
+    progress_transient: bool = False,
 ) -> PushResult:
     _require_push_token(config)
     local_root = config.local_root_path
@@ -715,40 +810,50 @@ async def push_to_hf(
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
     }
-    current_records = scan_local_files(
-        local_root,
+    current_records = _scan_local_records_for_operation(
+        config,
         previous_records=previous_records,
         path_filter=path_filter,
-    )
-    status = await compute_status(
-        config.state_db_path,
-        current_records,
-        previous_records=previous_filtered,
-    )
-
-    upload_jobs = [
-        _UploadJob(path=record.path, size=record.size)
-        for record in sorted([*status.new_files, *status.modified_files], key=lambda item: item.path)
-    ]
-    upload_paths = {job.path for job in upload_jobs}
-    skipped_paths = sorted(
-        record.path for record in current_records if record.path not in upload_paths
-    )
-    uploaded_paths = _run_upload_jobs(
-        config,
-        upload_jobs,
         console=console,
-        small_file_workers=small_file_workers,
     )
+    with _phase_timer(console, "planning"):
+        status = await compute_status(
+            config.state_db_path,
+            current_records,
+            previous_records=previous_filtered,
+        )
+
+        upload_jobs = [
+            _UploadJob(path=record.path, size=record.size)
+            for record in sorted([*status.new_files, *status.modified_files], key=lambda item: item.path)
+        ]
+        upload_paths = {job.path for job in upload_jobs}
+        skipped_paths = sorted(
+            record.path for record in current_records if record.path not in upload_paths
+        )
+    with _phase_timer(console, "uploads"):
+        uploaded_paths = _run_upload_jobs(
+            config,
+            upload_jobs,
+            console=console,
+            small_file_workers=small_file_workers,
+            progress_transient=progress_transient,
+        )
 
     deleted_remote_paths: list[str] = []
-    for record in status.deleted_files:
-        if not _safe_to_delete_remote(config, record.path):
-            continue
-        if _delete_remote_one(config, record.path):
-            deleted_remote_paths.append(record.path)
+    with _phase_timer(console, "remote deletes"):
+        for record in status.deleted_files:
+            if not _safe_to_delete_remote(config, record.path):
+                continue
+            if _delete_remote_one(config, record.path):
+                deleted_remote_paths.append(record.path)
 
-    snapshot_count = await _refresh_full_snapshot(config, previous_records=previous_records)
+    snapshot_map = _merge_snapshot_scope(
+        previous_records,
+        path_filter=path_filter,
+        scope_records=current_records,
+    )
+    snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
 
     return PushResult(
         uploaded_paths=uploaded_paths,
@@ -766,6 +871,7 @@ async def sync_with_hf(
     prefer_conflicts: Literal["remote", "local"] = "remote",
     console: Console | None = None,
     small_file_workers: int = DEFAULT_SMALL_FILE_WORKERS,
+    progress_transient: bool = False,
 ) -> SyncResult:
     if prefer_conflicts not in {"remote", "local"}:
         raise ValueError("prefer_conflicts must be 'remote' or 'local'")
@@ -781,141 +887,168 @@ async def sync_with_hf(
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
     }
-    current_records = scan_local_files(
-        local_root,
+    current_records = _scan_local_records_for_operation(
+        config,
         previous_records=previous_records,
         path_filter=path_filter,
+        console=console,
     )
     local_status = diff_records(previous_filtered, current_records)
     local_map = {record.path: record for record in current_records}
 
-    remote_files = _remote_manifest(config, path_filter=path_filter)
+    with _phase_timer(console, "remote manifest"):
+        remote_files = _remote_manifest(config, path_filter=path_filter)
     remote_map = {record.path: record for record in remote_files}
 
-    local_upserts = {record.path: record for record in [*local_status.new_files, *local_status.modified_files]}
-    local_deletes = {record.path for record in local_status.deleted_files}
+    with _phase_timer(console, "planning"):
+        local_upserts = {record.path: record for record in [*local_status.new_files, *local_status.modified_files]}
+        local_deletes = {record.path for record in local_status.deleted_files}
 
-    remote_upserts: dict[str, RemoteFileRecord] = {}
-    for remote in remote_files:
-        if _remote_changed_since_snapshot(remote, previous_records.get(remote.path)):
-            remote_upserts[remote.path] = remote
-    remote_deletes = {
-        path for path in previous_records if path_filter.matches(path) and path not in remote_map
-    }
+        remote_upserts: dict[str, RemoteFileRecord] = {}
+        for remote in remote_files:
+            if _remote_changed_since_snapshot(remote, previous_records.get(remote.path)):
+                remote_upserts[remote.path] = remote
+        remote_deletes = {
+            path for path in previous_records if path_filter.matches(path) and path not in remote_map
+        }
 
-    all_changed_paths = sorted(set(local_upserts) | local_deletes | set(remote_upserts) | remote_deletes)
+        all_changed_paths = sorted(set(local_upserts) | local_deletes | set(remote_upserts) | remote_deletes)
 
-    download_jobs_map: dict[str, _DownloadJob] = {}
-    upload_jobs_map: dict[str, _UploadJob] = {}
-    delete_local_paths: set[str] = set()
-    delete_remote_paths: set[str] = set()
-    conflict_paths: list[str] = []
-    skipped_paths: set[str] = set()
+        download_jobs_map: dict[str, _DownloadJob] = {}
+        upload_jobs_map: dict[str, _UploadJob] = {}
+        delete_local_paths: set[str] = set()
+        delete_remote_paths: set[str] = set()
+        conflict_paths: list[str] = []
+        skipped_paths: set[str] = set()
 
-    for path in all_changed_paths:
-        local_action = "none"
-        remote_action = "none"
-        if path in local_upserts:
-            local_action = "upsert"
-        elif path in local_deletes:
-            local_action = "delete"
-        if path in remote_upserts:
-            remote_action = "upsert"
-        elif path in remote_deletes:
-            remote_action = "delete"
+        for path in all_changed_paths:
+            local_action = "none"
+            remote_action = "none"
+            if path in local_upserts:
+                local_action = "upsert"
+            elif path in local_deletes:
+                local_action = "delete"
+            if path in remote_upserts:
+                remote_action = "upsert"
+            elif path in remote_deletes:
+                remote_action = "delete"
 
-        if local_action == "none" and remote_action == "none":
-            continue
+            if local_action == "none" and remote_action == "none":
+                continue
 
-        if local_action == "none":
-            if remote_action == "upsert":
-                download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
-            elif remote_action == "delete":
-                delete_local_paths.add(path)
-            continue
+            if local_action == "none":
+                if remote_action == "upsert":
+                    download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
+                elif remote_action == "delete":
+                    delete_local_paths.add(path)
+                continue
 
-        if remote_action == "none":
-            if local_action == "upsert":
-                record = local_upserts[path]
-                upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
-            elif local_action == "delete":
-                delete_remote_paths.add(path)
-            continue
+            if remote_action == "none":
+                if local_action == "upsert":
+                    record = local_upserts[path]
+                    upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
+                elif local_action == "delete":
+                    delete_remote_paths.add(path)
+                continue
 
-        # Both sides changed.
-        if local_action == "delete" and remote_action == "delete":
-            skipped_paths.add(path)
-            continue
+            # Both sides changed.
+            if local_action == "delete" and remote_action == "delete":
+                skipped_paths.add(path)
+                continue
 
-        if (
-            local_action == "upsert"
-            and remote_action == "upsert"
-            and _remote_matches_local(remote_upserts[path], local_map.get(path))
-        ):
-            skipped_paths.add(path)
-            continue
+            if (
+                local_action == "upsert"
+                and remote_action == "upsert"
+                and _remote_matches_local(remote_upserts[path], local_map.get(path))
+            ):
+                skipped_paths.add(path)
+                continue
 
-        conflict_paths.append(path)
-        if prefer_conflicts == "remote":
-            if remote_action == "upsert":
-                download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
-                upload_jobs_map.pop(path, None)
-                delete_remote_paths.discard(path)
-            elif remote_action == "delete":
-                delete_local_paths.add(path)
-                upload_jobs_map.pop(path, None)
-        else:
-            _require_push_token(config)
-            if local_action == "upsert":
-                record = local_upserts[path]
-                upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
-                download_jobs_map.pop(path, None)
-                delete_local_paths.discard(path)
-            elif local_action == "delete":
-                delete_remote_paths.add(path)
-                download_jobs_map.pop(path, None)
+            conflict_paths.append(path)
+            if prefer_conflicts == "remote":
+                if remote_action == "upsert":
+                    download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
+                    upload_jobs_map.pop(path, None)
+                    delete_remote_paths.discard(path)
+                elif remote_action == "delete":
+                    delete_local_paths.add(path)
+                    upload_jobs_map.pop(path, None)
+            else:
+                _require_push_token(config)
+                if local_action == "upsert":
+                    record = local_upserts[path]
+                    upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
+                    download_jobs_map.pop(path, None)
+                    delete_local_paths.discard(path)
+                elif local_action == "delete":
+                    delete_remote_paths.add(path)
+                    download_jobs_map.pop(path, None)
 
-    downloaded_paths = _run_download_jobs(
-        config,
-        sorted(download_jobs_map.values(), key=lambda item: item.remote.path),
-        console=console,
-        small_file_workers=small_file_workers,
-    )
+    with _phase_timer(console, "downloads"):
+        downloaded_paths = _run_download_jobs(
+            config,
+            sorted(download_jobs_map.values(), key=lambda item: item.remote.path),
+            console=console,
+            small_file_workers=small_file_workers,
+            progress_transient=progress_transient,
+        )
 
     uploaded_paths: list[str] = []
     if upload_jobs_map:
         _require_push_token(config)
-        uploaded_paths = _run_upload_jobs(
-            config,
-            sorted(upload_jobs_map.values(), key=lambda item: item.path),
-            console=console,
-            small_file_workers=small_file_workers,
-        )
+        with _phase_timer(console, "uploads"):
+            uploaded_paths = _run_upload_jobs(
+                config,
+                sorted(upload_jobs_map.values(), key=lambda item: item.path),
+                console=console,
+                small_file_workers=small_file_workers,
+                progress_transient=progress_transient,
+            )
 
     deleted_local_done: list[str] = []
-    for path in sorted(delete_local_paths):
-        if _delete_local_file(local_root, path):
-            deleted_local_done.append(path)
+    with _phase_timer(console, "local deletes"):
+        for path in sorted(delete_local_paths):
+            if _delete_local_file(local_root, path):
+                deleted_local_done.append(path)
 
     deleted_remote_done: list[str] = []
     if delete_remote_paths:
         _require_push_token(config)
-    for path in sorted(delete_remote_paths):
-        if not _safe_to_delete_remote(config, path):
-            skipped_paths.add(path)
-            continue
-        if _delete_remote_one(config, path):
-            deleted_remote_done.append(path)
+    with _phase_timer(console, "remote deletes"):
+        for path in sorted(delete_remote_paths):
+            if not _safe_to_delete_remote(config, path):
+                skipped_paths.add(path)
+                continue
+            if _delete_remote_one(config, path):
+                deleted_remote_done.append(path)
 
-    snapshot_count = await _refresh_full_snapshot(config, previous_records=previous_records)
+    snapshot_map = _merge_snapshot_scope(
+        previous_records,
+        path_filter=path_filter,
+        scope_records=current_records,
+    )
+    _apply_snapshot_removals(snapshot_map, deleted_local_done)
+    snapshot_map.update(
+        _refresh_snapshot_paths(
+            config,
+            previous_records=previous_records,
+            paths=downloaded_paths,
+            console=console,
+        )
+    )
+    snapshot_count = await _write_snapshot_map(config, snapshot_map=snapshot_map, console=console)
+    downloaded_set = set(downloaded_paths)
+    uploaded_set = set(uploaded_paths)
+    deleted_local_done_set = set(deleted_local_done)
+    deleted_remote_done_set = set(deleted_remote_done)
     skipped_paths.update(
         path
         for path in remote_map
         if path_filter.matches(path)
-        and path not in set(downloaded_paths)
-        and path not in set(uploaded_paths)
-        and path not in delete_local_paths
-        and path not in delete_remote_paths
+        and path not in downloaded_set
+        and path not in uploaded_set
+        and path not in deleted_local_done_set
+        and path not in deleted_remote_done_set
         and path not in conflict_paths
     )
 
