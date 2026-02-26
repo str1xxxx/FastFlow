@@ -35,6 +35,7 @@ LARGE_EXTENSIONS = {".rpf"}
 DEFAULT_SMALL_FILE_WORKERS = 6
 FASTFLOW_TRASH_DIRNAME = ".fastflow_trash"
 REMOTE_CACHE_INITIALIZED_META_KEY = "remote_cache_initialized"
+MAX_COMMIT_OPERATIONS = 500
 T = TypeVar("T")
 
 
@@ -108,6 +109,16 @@ def _load_hf_symbols():
             "huggingface_hub is required for `ff pull`/`ff push`/`ff sync`. Install dependencies first."
         ) from exc
     return HfApi, hf_hub_download
+
+
+def _load_hf_commit_symbols():
+    try:
+        from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required for commit operations. Install dependencies first."
+        ) from exc
+    return HfApi, CommitOperationAdd, CommitOperationDelete
 
 
 @contextmanager
@@ -705,6 +716,85 @@ def _run_upload_jobs(
     return uploaded
 
 
+def _chunk_list(items: list[T], chunk_size: int) -> list[list[T]]:
+    if chunk_size <= 0:
+        return [items]
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _run_remote_commit_jobs(
+    config: FastFlowConfig,
+    *,
+    add_jobs: list[_UploadJob],
+    delete_paths: list[str],
+    console: Console | None,
+    max_operations_per_commit: int = MAX_COMMIT_OPERATIONS,
+) -> tuple[list[str], list[str], list[str]]:
+    if not add_jobs and not delete_paths:
+        return [], [], []
+
+    _require_push_token(config)
+    HfApi, CommitOperationAdd, CommitOperationDelete = _load_hf_commit_symbols()
+    token = _token_for_hf(config)
+    api = HfApi(token=token)
+
+    missing_local_paths: list[str] = []
+    staged_operations: list[tuple[str, str, Any]] = []
+
+    for job in sorted(add_jobs, key=lambda item: item.path):
+        local_path = _local_file_path(config.local_root_path, job.path)
+        if not local_path.exists() or not local_path.is_file():
+            missing_local_paths.append(job.path)
+            continue
+        staged_operations.append(
+            (
+                "add",
+                job.path,
+                CommitOperationAdd(path_in_repo=job.path, path_or_fileobj=str(local_path)),
+            )
+        )
+
+    for path in sorted(delete_paths):
+        staged_operations.append(("delete", path, CommitOperationDelete(path_in_repo=path)))
+
+    if not staged_operations:
+        return [], [], missing_local_paths
+
+    uploaded_paths: list[str] = []
+    deleted_paths: list[str] = []
+    operation_batches = _chunk_list(staged_operations, max_operations_per_commit)
+
+    with _suppress_hf_progress_bars():
+        for index, batch in enumerate(operation_batches, start=1):
+            operations = [item[2] for item in batch]
+            label = f"remote commit {index}/{len(operation_batches)}"
+            if console is not None:
+                console.print(f"[cyan]Phase:[/cyan] {label} ...")
+
+            def _call():
+                return api.create_commit(
+                    repo_id=config.repo_id,
+                    repo_type=HF_REPO_TYPE,
+                    token=token,
+                    operations=operations,
+                    commit_message=f"FastFlow sync batch {index}/{len(operation_batches)}",
+                )
+
+            start = time.perf_counter()
+            _retry_on_timeout(_call, operation=f"create_commit:{index}")
+            elapsed = time.perf_counter() - start
+            if console is not None:
+                console.print(f"[dim]Phase complete:[/dim] {label} ({elapsed:.1f}s)")
+
+            for op_type, path, _ in batch:
+                if op_type == "add":
+                    uploaded_paths.append(path)
+                else:
+                    deleted_paths.append(path)
+
+    return sorted(uploaded_paths), sorted(deleted_paths), sorted(missing_local_paths)
+
+
 def _remote_changed_since_snapshot(remote: RemoteFileRecord, snapshot: FileRecord | None) -> bool:
     if snapshot is None:
         return True
@@ -935,6 +1025,9 @@ async def push_to_hf(
     previous_remote_records = await load_remote_records(config.state_db_path)
     remote_cache_initialized = await _is_remote_cache_initialized(config)
     remote_cache_bootstrapped = not remote_cache_initialized
+    with _phase_timer(console, "remote manifest"):
+        remote_files_before_push = _remote_manifest(config, path_filter=path_filter)
+    remote_paths_before_push = {item.path for item in remote_files_before_push}
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
     }
@@ -959,22 +1052,28 @@ async def push_to_hf(
         skipped_paths = sorted(
             record.path for record in current_records if record.path not in upload_paths
         )
-    with _phase_timer(console, "uploads"):
-        uploaded_paths = _run_upload_jobs(
-            config,
-            upload_jobs,
-            console=console,
-            small_file_workers=small_file_workers,
-            progress_transient=progress_transient,
-        )
-
-    deleted_remote_paths: list[str] = []
-    with _phase_timer(console, "remote deletes"):
+    skipped_paths_set = set(skipped_paths)
+    delete_remote_candidates: list[str] = []
+    with _phase_timer(console, "planning remote deletes"):
         for record in status.deleted_files:
             if not _safe_to_delete_remote(config, record.path):
                 continue
-            if _delete_remote_one(config, record.path):
-                deleted_remote_paths.append(record.path)
+            if record.path in remote_paths_before_push:
+                delete_remote_candidates.append(record.path)
+            else:
+                skipped_paths_set.add(record.path)
+
+    uploaded_paths: list[str] = []
+    deleted_remote_paths: list[str] = []
+    missing_upload_paths: list[str] = []
+    if upload_jobs or delete_remote_candidates:
+        uploaded_paths, deleted_remote_paths, missing_upload_paths = _run_remote_commit_jobs(
+            config,
+            add_jobs=upload_jobs,
+            delete_paths=delete_remote_candidates,
+            console=console,
+        )
+    skipped_paths_set.update(missing_upload_paths)
 
     snapshot_map = _merge_snapshot_scope(
         previous_records,
@@ -1000,7 +1099,7 @@ async def push_to_hf(
     return PushResult(
         uploaded_paths=uploaded_paths,
         deleted_remote_paths=sorted(deleted_remote_paths),
-        skipped_paths=skipped_paths,
+        skipped_paths=sorted(skipped_paths_set),
         snapshot_count=snapshot_count,
         remote_cache_bootstrapped=remote_cache_bootstrapped,
     )
@@ -1152,17 +1251,27 @@ async def sync_with_hf(
             progress_transient=progress_transient,
         )
 
+    delete_remote_commit_paths: list[str] = []
+    for path in sorted(delete_remote_paths):
+        if not _safe_to_delete_remote(config, path):
+            skipped_paths.add(path)
+            continue
+        if path not in remote_map:
+            skipped_paths.add(path)
+            continue
+        delete_remote_commit_paths.append(path)
+
     uploaded_paths: list[str] = []
-    if upload_jobs_map:
-        _require_push_token(config)
-        with _phase_timer(console, "uploads"):
-            uploaded_paths = _run_upload_jobs(
-                config,
-                sorted(upload_jobs_map.values(), key=lambda item: item.path),
-                console=console,
-                small_file_workers=small_file_workers,
-                progress_transient=progress_transient,
-            )
+    deleted_remote_done: list[str] = []
+    missing_upload_paths: list[str] = []
+    if upload_jobs_map or delete_remote_commit_paths:
+        uploaded_paths, deleted_remote_done, missing_upload_paths = _run_remote_commit_jobs(
+            config,
+            add_jobs=sorted(upload_jobs_map.values(), key=lambda item: item.path),
+            delete_paths=delete_remote_commit_paths,
+            console=console,
+        )
+    skipped_paths.update(missing_upload_paths)
 
     deleted_local_done: list[str] = []
     trash_session_dir = _new_trash_session_dir(local_root) if delete_local_paths else None
@@ -1174,17 +1283,6 @@ async def sync_with_hf(
                 trash_session_dir=trash_session_dir,
             ):
                 deleted_local_done.append(path)
-
-    deleted_remote_done: list[str] = []
-    if delete_remote_paths:
-        _require_push_token(config)
-    with _phase_timer(console, "remote deletes"):
-        for path in sorted(delete_remote_paths):
-            if not _safe_to_delete_remote(config, path):
-                skipped_paths.add(path)
-                continue
-            if _delete_remote_one(config, path):
-                deleted_remote_done.append(path)
 
     snapshot_map = _merge_snapshot_scope(
         previous_records,
