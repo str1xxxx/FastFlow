@@ -114,6 +114,7 @@ ff sync --prefer local --include "mods/**"
 - `.gitattributes` may appear during sync because Hugging Face can manage it server-side for large files
 - FastFlow now has a bulk-delete safety stop. If a sync/push plans a large delete set, it aborts instead of deleting files.
 - For intentional large deletions, temporarily set `FASTFLOW_ALLOW_BULK_DELETE=1` and rerun the command.
+- `ff sync` propagates local deletes to remote only when remote is provably unchanged and push auth is available; otherwise it keeps remote as source of truth.
 
 ## Publish to GitHub
 

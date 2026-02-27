@@ -849,6 +849,33 @@ def _remote_changed_since_snapshot(
     return False
 
 
+def _remote_unchanged_with_confidence(
+    remote: RemoteFileRecord,
+    snapshot: RemoteSnapshotRecord | None,
+) -> bool:
+    if snapshot is None:
+        return False
+
+    compared_any_field = False
+
+    if remote.oid and snapshot.oid:
+        compared_any_field = True
+        if remote.oid != snapshot.oid:
+            return False
+
+    if remote.sha256 and snapshot.sha256:
+        compared_any_field = True
+        if remote.sha256 != snapshot.sha256:
+            return False
+
+    if remote.size is not None and snapshot.size is not None:
+        compared_any_field = True
+        if remote.size != snapshot.size:
+            return False
+
+    return compared_any_field
+
+
 def _remote_matches_local(remote: RemoteFileRecord, local: FileRecord | None) -> bool:
     if local is None:
         return False
@@ -1210,6 +1237,7 @@ async def sync_with_hf(
 
     local_root = config.local_root_path
     local_root.mkdir(parents=True, exist_ok=True)
+    can_push = bool(_token_for_hf(config))
     path_filter = build_path_filter(include_patterns, exclude_patterns)
 
     previous_records = await load_records(config.state_db_path)
@@ -1302,10 +1330,19 @@ async def sync_with_hf(
                     record = local_upserts[path]
                     upload_jobs_map[path] = _UploadJob(path=record.path, size=record.size)
                 elif local_action == "delete":
-                    if prefer_conflicts == "local":
+                    remote_existing = remote_map.get(path)
+                    remote_snapshot = previous_remote_records.get(path)
+                    can_propagate_delete = (
+                        can_push
+                        and remote_existing is not None
+                        and _remote_unchanged_with_confidence(remote_existing, remote_snapshot)
+                    )
+                    if can_propagate_delete:
+                        # Non-conflict case: local delete + unchanged remote => propagate delete.
                         delete_remote_paths.add(path)
                     else:
-                        remote_existing = remote_map.get(path)
+                        # If we cannot prove remote is unchanged (or cannot push),
+                        # keep remote as source of truth.
                         if remote_existing is not None:
                             download_jobs_map[path] = _DownloadJob(remote=remote_existing)
                         else:
