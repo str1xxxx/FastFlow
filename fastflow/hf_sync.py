@@ -1288,7 +1288,11 @@ async def sync_with_hf(
 
             if local_action == "none":
                 if remote_action == "upsert":
-                    download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
+                    remote_record = remote_upserts[path]
+                    if _remote_matches_local(remote_record, local_map.get(path)):
+                        skipped_paths.add(path)
+                    else:
+                        download_jobs_map[path] = _DownloadJob(remote=remote_record)
                 elif remote_action == "delete":
                     delete_local_paths.add(path)
                 continue
@@ -1324,7 +1328,12 @@ async def sync_with_hf(
             conflict_paths.append(path)
             if prefer_conflicts == "remote":
                 if remote_action == "upsert":
-                    download_jobs_map[path] = _DownloadJob(remote=remote_upserts[path])
+                    remote_record = remote_upserts[path]
+                    if _remote_matches_local(remote_record, local_map.get(path)):
+                        skipped_paths.add(path)
+                        download_jobs_map.pop(path, None)
+                    else:
+                        download_jobs_map[path] = _DownloadJob(remote=remote_record)
                     upload_jobs_map.pop(path, None)
                     delete_remote_paths.discard(path)
                 elif remote_action == "delete":
