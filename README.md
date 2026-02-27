@@ -112,6 +112,8 @@ ff sync --prefer local --include "mods/**"
 - `ff pull`, `ff push`, and `ff sync` update `.ff_state.db` after successful transfers
 - The current implementation uses Hugging Face `repo_type="model"`
 - `.gitattributes` may appear during sync because Hugging Face can manage it server-side for large files
+- FastFlow now has a bulk-delete safety stop. If a sync/push plans a large delete set, it aborts instead of deleting files.
+- For intentional large deletions, temporarily set `FASTFLOW_ALLOW_BULK_DELETE=1` and rerun the command.
 
 ## Publish to GitHub
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -35,7 +36,12 @@ LARGE_EXTENSIONS = {".rpf"}
 DEFAULT_SMALL_FILE_WORKERS = 6
 FASTFLOW_TRASH_DIRNAME = ".fastflow_trash"
 REMOTE_CACHE_INITIALIZED_META_KEY = "remote_cache_initialized"
+REMOTE_CACHE_REPO_ID_META_KEY = "remote_cache_repo_id"
+LOCAL_SNAPSHOT_REPO_ID_META_KEY = "local_snapshot_repo_id"
 MAX_COMMIT_OPERATIONS = 500
+BULK_DELETE_MIN_COUNT = 20
+BULK_DELETE_MIN_RATIO = 0.25
+BULK_DELETE_ALLOW_ENV = "FASTFLOW_ALLOW_BULK_DELETE"
 T = TypeVar("T")
 
 
@@ -326,11 +332,29 @@ def _merge_remote_snapshot_scope(
 
 
 async def _is_remote_cache_initialized(config: FastFlowConfig) -> bool:
-    return (await get_meta(config.state_db_path, REMOTE_CACHE_INITIALIZED_META_KEY)) == "1"
+    initialized = (await get_meta(config.state_db_path, REMOTE_CACHE_INITIALIZED_META_KEY)) == "1"
+    if not initialized:
+        return False
+    cached_repo_id = (await get_meta(config.state_db_path, REMOTE_CACHE_REPO_ID_META_KEY) or "").strip()
+    return cached_repo_id == config.repo_id
 
 
 async def _set_remote_cache_initialized(config: FastFlowConfig, initialized: bool = True) -> None:
     await set_meta(config.state_db_path, REMOTE_CACHE_INITIALIZED_META_KEY, "1" if initialized else "0")
+    await set_meta(
+        config.state_db_path,
+        REMOTE_CACHE_REPO_ID_META_KEY,
+        config.repo_id if initialized else "",
+    )
+
+
+async def _is_local_snapshot_bound_to_repo(config: FastFlowConfig) -> bool:
+    snapshot_repo_id = (await get_meta(config.state_db_path, LOCAL_SNAPSHOT_REPO_ID_META_KEY) or "").strip()
+    return snapshot_repo_id == config.repo_id
+
+
+async def _set_local_snapshot_repo_id(config: FastFlowConfig) -> None:
+    await set_meta(config.state_db_path, LOCAL_SNAPSHOT_REPO_ID_META_KEY, config.repo_id)
 
 
 async def _write_remote_snapshot_map(
@@ -741,7 +765,11 @@ def _run_remote_commit_jobs(
     missing_local_paths: list[str] = []
     staged_operations: list[tuple[str, str, Any]] = []
 
+    seen_add_paths: set[str] = set()
     for job in sorted(add_jobs, key=lambda item: item.path):
+        if job.path in seen_add_paths:
+            continue
+        seen_add_paths.add(job.path)
         local_path = _local_file_path(config.local_root_path, job.path)
         if not local_path.exists() or not local_path.is_file():
             missing_local_paths.append(job.path)
@@ -754,7 +782,9 @@ def _run_remote_commit_jobs(
             )
         )
 
-    for path in sorted(delete_paths):
+    for path in sorted(set(delete_paths)):
+        if path in seen_add_paths:
+            continue
         staged_operations.append(("delete", path, CommitOperationDelete(path_in_repo=path)))
 
     if not staged_operations:
@@ -795,17 +825,27 @@ def _run_remote_commit_jobs(
     return sorted(uploaded_paths), sorted(deleted_paths), sorted(missing_local_paths)
 
 
-def _remote_changed_since_snapshot(remote: RemoteFileRecord, snapshot: FileRecord | None) -> bool:
+def _remote_changed_since_snapshot(
+    remote: RemoteFileRecord,
+    snapshot: RemoteSnapshotRecord | None,
+) -> bool:
     if snapshot is None:
         return True
-    if remote.sha256:
+
+    if remote.oid and snapshot.oid:
+        if remote.oid != snapshot.oid:
+            return True
+
+    if remote.sha256 and snapshot.sha256:
         if remote.sha256 != snapshot.sha256:
             return True
-        if remote.size is not None and remote.size != snapshot.size:
+
+    if remote.size is not None and snapshot.size is not None:
+        if remote.size != snapshot.size:
             return True
-        return False
-    if remote.size is not None and remote.size != snapshot.size:
-        return True
+
+    # If we don't have comparable metadata, stay conservative and treat as unchanged
+    # to avoid destructive false positives on deletes/conflicts.
     return False
 
 
@@ -831,6 +871,31 @@ def _require_push_token(config: FastFlowConfig) -> None:
 
 def _paths_with_filter(paths: list[str] | set[str], path_filter: PathFilter) -> list[str]:
     return sorted(path for path in paths if path_filter.matches(path))
+
+
+def _allow_bulk_delete() -> bool:
+    value = os.getenv(BULK_DELETE_ALLOW_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _guard_bulk_delete_plan(
+    *,
+    action: str,
+    delete_paths: list[str] | set[str],
+    scope_count: int,
+) -> None:
+    delete_count = len(delete_paths)
+    if delete_count == 0:
+        return
+    if _allow_bulk_delete():
+        return
+
+    ratio = (delete_count / scope_count) if scope_count > 0 else 1.0
+    if delete_count >= BULK_DELETE_MIN_COUNT and ratio >= BULK_DELETE_MIN_RATIO:
+        raise RuntimeError(
+            f"Safety stop: refusing bulk {action} ({delete_count} path(s), {ratio:.0%} of scope). "
+            f"If this is intentional, set {BULK_DELETE_ALLOW_ENV}=1 and run again."
+        )
 
 
 @contextmanager
@@ -914,6 +979,7 @@ async def _write_snapshot_map(
     with _phase_timer(console, "snapshot update"):
         records = sorted(snapshot_map.values(), key=lambda item: item.path)
         await replace_snapshot(config.state_db_path, records)
+        await _set_local_snapshot_repo_id(config)
     return len(snapshot_map)
 
 
@@ -933,6 +999,8 @@ async def pull_from_hf(
     previous_records = await load_records(config.state_db_path)
     previous_remote_records = await load_remote_records(config.state_db_path)
     remote_cache_initialized = await _is_remote_cache_initialized(config)
+    if not remote_cache_initialized:
+        previous_remote_records = {}
     remote_cache_bootstrapped = not remote_cache_initialized
     with _phase_timer(console, "remote manifest"):
         remote_files = _remote_manifest(config, path_filter=path_filter)
@@ -955,6 +1023,11 @@ async def pull_from_hf(
             )
         else:
             removed_scope_paths = []
+        _guard_bulk_delete_plan(
+            action="local delete from remote state",
+            delete_paths=removed_scope_paths,
+            scope_count=max(1, len(remote_map) + len(removed_scope_paths)),
+        )
     deleted_local_paths: list[str] = []
     trash_session_dir = _new_trash_session_dir(local_root) if removed_scope_paths else None
 
@@ -1022,8 +1095,11 @@ async def push_to_hf(
 
     path_filter = build_path_filter(include_patterns, exclude_patterns)
     previous_records = await load_records(config.state_db_path)
+    local_snapshot_bound = await _is_local_snapshot_bound_to_repo(config)
     previous_remote_records = await load_remote_records(config.state_db_path)
     remote_cache_initialized = await _is_remote_cache_initialized(config)
+    if not remote_cache_initialized:
+        previous_remote_records = {}
     remote_cache_bootstrapped = not remote_cache_initialized
     with _phase_timer(console, "remote manifest"):
         remote_files_before_push = _remote_manifest(config, path_filter=path_filter)
@@ -1055,13 +1131,24 @@ async def push_to_hf(
     skipped_paths_set = set(skipped_paths)
     delete_remote_candidates: list[str] = []
     with _phase_timer(console, "planning remote deletes"):
-        for record in status.deleted_files:
+        deleted_candidates = status.deleted_files if local_snapshot_bound else []
+        if not local_snapshot_bound and status.deleted_files and console is not None:
+            console.print(
+                "[yellow]Local snapshot repo binding is missing/mismatched; "
+                "remote delete propagation is disabled for this run.[/yellow]"
+            )
+        for record in deleted_candidates:
             if not _safe_to_delete_remote(config, record.path):
                 continue
             if record.path in remote_paths_before_push:
                 delete_remote_candidates.append(record.path)
             else:
                 skipped_paths_set.add(record.path)
+    _guard_bulk_delete_plan(
+        action="remote delete",
+        delete_paths=delete_remote_candidates,
+        scope_count=max(1, len(remote_paths_before_push)),
+    )
 
     uploaded_paths: list[str] = []
     deleted_remote_paths: list[str] = []
@@ -1126,8 +1213,11 @@ async def sync_with_hf(
     path_filter = build_path_filter(include_patterns, exclude_patterns)
 
     previous_records = await load_records(config.state_db_path)
+    local_snapshot_bound = await _is_local_snapshot_bound_to_repo(config)
     previous_remote_records = await load_remote_records(config.state_db_path)
     remote_cache_initialized = await _is_remote_cache_initialized(config)
+    if not remote_cache_initialized:
+        previous_remote_records = {}
     remote_cache_bootstrapped = not remote_cache_initialized
     previous_filtered = {
         path: record for path, record in previous_records.items() if path_filter.matches(path)
@@ -1147,11 +1237,20 @@ async def sync_with_hf(
 
     with _phase_timer(console, "planning"):
         local_upserts = {record.path: record for record in [*local_status.new_files, *local_status.modified_files]}
-        local_deletes = {record.path for record in local_status.deleted_files}
+        local_deletes = (
+            {record.path for record in local_status.deleted_files}
+            if local_snapshot_bound
+            else set()
+        )
+        if not local_snapshot_bound and local_status.deleted_files and console is not None:
+            console.print(
+                "[yellow]Local snapshot repo binding is missing/mismatched; "
+                "local-delete conflict propagation is disabled for this run.[/yellow]"
+            )
 
         remote_upserts: dict[str, RemoteFileRecord] = {}
         for remote in remote_files:
-            if _remote_changed_since_snapshot(remote, previous_records.get(remote.path)):
+            if _remote_changed_since_snapshot(remote, previous_remote_records.get(remote.path)):
                 remote_upserts[remote.path] = remote
         remote_deletes = (
             {
@@ -1241,6 +1340,11 @@ async def sync_with_hf(
                 elif local_action == "delete":
                     delete_remote_paths.add(path)
                     download_jobs_map.pop(path, None)
+        _guard_bulk_delete_plan(
+            action="local delete from remote state",
+            delete_paths=delete_local_paths,
+            scope_count=max(1, len(remote_map) + len(remote_deletes)),
+        )
 
     with _phase_timer(console, "downloads"):
         downloaded_paths = _run_download_jobs(
@@ -1260,6 +1364,11 @@ async def sync_with_hf(
             skipped_paths.add(path)
             continue
         delete_remote_commit_paths.append(path)
+    _guard_bulk_delete_plan(
+        action="remote delete",
+        delete_paths=delete_remote_commit_paths,
+        scope_count=max(1, len(remote_map)),
+    )
 
     uploaded_paths: list[str] = []
     deleted_remote_done: list[str] = []
